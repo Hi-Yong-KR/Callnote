@@ -8,6 +8,8 @@ import queue
 import shutil
 import sys
 import threading
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from urllib.request import Request, urlopen
 import tkinter as tk
@@ -122,13 +124,22 @@ def _download_qwen_model():
     if (LLM_MODEL / "config.json").is_file() and any(LLM_MODEL.glob("*.safetensors")):
         return
     events.put(("download_indeterminate", "Qwen3 4B 상담 분석 모델 다운로드 중 (약 8.1GB)…"))
+    # PyInstaller's --windowed build has no console and sets sys.stderr to None.
+    # Hugging Face's tqdm progress renderer writes to stderr, which can fail with
+    # "'NoneType' object has no attribute 'write'" during snapshot_download.
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["TQDM_DISABLE"] = "1"
     from huggingface_hub import snapshot_download
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id="Qwen/Qwen3-4B-Instruct-2507",
-        local_dir=str(LLM_MODEL),
-        ignore_patterns=["*.onnx", "*.tflite", "*.msgpack", "*.gguf"],
-    )
+    # Keep third-party download/logging code from writing to the missing
+    # standard streams in a windowed PyInstaller process.
+    with open(os.devnull, "w", encoding="utf-8") as quiet_stream:
+        with redirect_stderr(quiet_stream), redirect_stdout(quiet_stream):
+            snapshot_download(
+                repo_id="Qwen/Qwen3-4B-Instruct-2507",
+                local_dir=str(LLM_MODEL),
+                ignore_patterns=["*.onnx", "*.tflite", "*.msgpack", "*.gguf"],
+            )
     cache = LLM_MODEL / ".cache"
     if cache.exists():
         shutil.rmtree(cache)
@@ -319,7 +330,14 @@ class CallnoteApp:
         try:
             ensure_models()
         except Exception as exc:
-            events.put(("model_error", str(exc)))
+            detail = traceback.format_exc()
+            try:
+                LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+                with (LOCAL_DATA / "callnote.log").open("a", encoding="utf-8") as log:
+                    log.write(detail + "\n")
+            except OSError:
+                pass
+            events.put(("model_error", f"{exc}\n\n자세한 오류 기록: {LOCAL_DATA / 'callnote.log'}"))
 
     def _append_chat(self, speaker, text):
         self.chat.configure(state="normal"); self.chat.insert("end", f"{speaker}: {text}\n\n"); self.chat.see("end"); self.chat.configure(state="disabled")
@@ -344,7 +362,8 @@ class CallnoteApp:
                     self.analyze_button.configure(state="normal" if self.audio_path and not self.busy else "disabled")
                 elif event[0] == "model_error":
                     self.model_download_running = False; self.model_progress.stop(); self.model_progress.configure(value=0)
-                    self.status.configure(text="모델 다운로드를 완료하지 못했습니다. 인터넷 연결을 확인한 뒤 다시 시도하세요.")
+                    first_line = event[1].splitlines()[0]
+                    self.status.configure(text=f"모델 다운로드 실패: {first_line} · ‘모델 다시 받기’를 눌러 재시도하세요.")
                     self.retry_button.pack(side="left", padx=5)
                     messagebox.showerror("모델 다운로드 오류", event[1], parent=self.root)
                 elif event[0] == "analysis_done":
