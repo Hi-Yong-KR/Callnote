@@ -4,7 +4,12 @@ Windows 데스크톱 앱으로 WAV 고객센터 상담을 분석합니다. 음�
 
 ## 다운로드 및 실행
 
-GitHub Releases에서 CPU용 또는 Titan Xp 등 Pascal GPU용 패키지를 내려받아 압축을 푼 뒤 `Callnote\Callnote.exe`를 실행합니다. Python, PyTorch, FFmpeg, 모델을 별도로 설치할 필요가 없습니다. 앱의 코드와 실행 종속성은 패키지에 포함되어 있습니다. GPU용 분할 패키지는 모든 파트를 같은 위치에 압축 해제해야 합니다.
+GitHub Releases에서 사용할 환경에 맞는 파일 하나를 내려받습니다.
+
+- CPU용 `Callnote-Windows-CPU.zip`: 압축을 푼 뒤 `Callnote\Callnote.exe`를 실행합니다.
+- Titan Xp 등 Pascal GPU용 `Callnote-Pascal-GPU.exe`: 실행해서 원하는 폴더에 압축을 푼 뒤, 생성된 `Callnote\Callnote.exe`를 실행합니다. 이 파일은 자동 압축해제 패키지이며 별도 압축 프로그램은 필요 없습니다. NVIDIA 드라이버가 설치되어 있어야 합니다.
+
+Python, PyTorch, FFmpeg를 별도로 설치할 필요가 없습니다. 앱의 코드와 실행 종속성은 패키지에 포함되어 있습니다. GPU 패키지는 GitHub의 파일당 2GiB 제한에 맞추기 위해 7-Zip으로 압축한 단일 EXE로 배포합니다.
 
 첫 실행에는 앱이 모델을 자동으로 다운로드합니다. Whisper large-v3와 Qwen3 모델 합계 약 10.9GB를 받기 위해 인터넷 연결과 저장 공간이 필요합니다. 내려받은 모델은 `%LOCALAPPDATA%\Callnote\models`에 저장되고, 이후 통화 분석은 오프라인으로 실행됩니다. 다운로드가 중단되면 앱을 다시 열고 **모델 다시 받기**를 누르세요. NVIDIA GPU용 빌드는 GPU를 자동 사용하고, GPU가 없으면 CPU로 동작합니다. 일반 빌드는 CPU 전용입니다.
 
@@ -31,6 +36,13 @@ RTX 20 시리즈 이상 최신 NVIDIA GPU는 다음 빌드를 사용합니다.
 ```
 
 일반 빌드는 `dist\Callnote`, GPU 빌드는 `dist-pascal\Callnote` 또는 `dist-modern\Callnote`에 생성됩니다. GPU 빌드에는 CUDA 지원 PyTorch가 포함되므로 용량이 더 큽니다. Pascal GPU는 CUDA 12.6 프로필을 사용하고, 최신 GPU는 CUDA 13.2 프로필을 사용합니다. 모델 가중치는 빌드 산출물이나 GitHub Release에 포함하지 않으며, 최종 사용자 앱이 첫 실행 때 받습니다.
+
+단일 배포 파일은 다음 명령으로 만듭니다. GPU 패키징에는 빌드 PC의 7-Zip 도구가 필요하며 최종 사용자에게는 필요하지 않습니다. GPU 패키지는 압축 무결성과 GitHub의 파일당 2GiB 제한을 확인합니다.
+
+```powershell
+.\package_windows.ps1
+.\package_windows.ps1 -Profile pascal -SevenZipPath "C:\Program Files\7-Zip\7z.exe"
+```
 
 ## 상담 분석 내용
 
