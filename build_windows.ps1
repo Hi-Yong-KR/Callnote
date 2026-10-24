@@ -14,7 +14,7 @@ $python = ".venv\Scripts\python.exe"
     --name Callnote `
     --collect-all whisper `
     --collect-all tiktoken `
-    --collect-submodules transformers.models.qwen2 `
+    --collect-submodules transformers.models.qwen3 `
     --collect-submodules huggingface_hub `
     app.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed with exit code $LASTEXITCODE" }

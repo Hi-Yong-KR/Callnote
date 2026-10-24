@@ -4,7 +4,7 @@ imageio-ffmpeg>=0.5
 
 # Local Korean Q&A and customer-support analysis model
 torch>=2.3
-transformers>=4.45,<5
+transformers>=4.51,<5
 accelerate>=0.34
 safetensors>=0.4
 huggingface-hub>=0.26

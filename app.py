@@ -23,7 +23,7 @@ ROOT = app_root()
 LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Callnote"
 MODEL_DIR = LOCAL_DATA / "models"
 WHISPER_MODEL = MODEL_DIR / "large-v3.pt"
-LLM_MODEL = MODEL_DIR / "qwen2.5-1.5b-instruct"
+LLM_MODEL = MODEL_DIR / "qwen3-4b-instruct-2507"
 SUPPORT_SYSTEM = """당신은 한국어 고객센터 상담 품질 분석가입니다. 대화 내용에 근거해 답하고, 없는 사실은 만들지 마세요. 통화의 핵심을 다음 관점에서 정리하세요: 고객 문의/불편, 상담원의 안내와 공감, 해결 결과와 미해결 사항, 고객 및 상담원이 약속한 후속 조치와 기한, 감정 흐름, 품질 개선 제안. 발화자나 약속 주체가 불분명하면 불분명하다고 쓰세요. 한국어로 읽기 쉽게 답하세요."""
 QA_SYSTEM = "당신은 고객센터 통화 기록 도우미입니다. 제공된 전사 내용만 근거로 한국어로 답하세요. 찾을 수 없는 정보는 통화에서 확인되지 않는다고 말하세요. 약속 주체, 일정, 금액은 추측하지 마세요."
 events: queue.Queue = queue.Queue()
@@ -56,7 +56,7 @@ def transcribe(audio_path: str) -> str:
 
 def generate(system: str, prompt: str) -> str:
     global _llm_model, _llm_tokenizer
-    if not (LLM_MODEL / "config.json").is_file():
+    if not (LLM_MODEL / "config.json").is_file() or not any(LLM_MODEL.glob("*.safetensors")):
         raise RuntimeError("질문 답변용 로컬 모델이 없습니다. 앱을 다시 시작해 모델 다운로드를 완료해 주세요.")
     import torch
     if _llm_model is None:
@@ -119,13 +119,13 @@ def _download_whisper_checkpoint():
 
 
 def _download_qwen_model():
-    if (LLM_MODEL / "config.json").is_file() and (LLM_MODEL / "model.safetensors").is_file():
+    if (LLM_MODEL / "config.json").is_file() and any(LLM_MODEL.glob("*.safetensors")):
         return
-    events.put(("download_indeterminate", "Qwen 2.5 상담 분석 모델 다운로드 중 (약 2.9GB)…"))
+    events.put(("download_indeterminate", "Qwen3 4B 상담 분석 모델 다운로드 중 (약 8.1GB)…"))
     from huggingface_hub import snapshot_download
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     snapshot_download(
-        repo_id="Qwen/Qwen2.5-1.5B-Instruct",
+        repo_id="Qwen/Qwen3-4B-Instruct-2507",
         local_dir=str(LLM_MODEL),
         ignore_patterns=["*.onnx", "*.tflite", "*.msgpack", "*.gguf"],
     )
@@ -191,7 +191,7 @@ class CallnoteApp:
         self.retry_button = ttk.Button(file_card, text="모델 다시 받기", command=self._start_model_setup)
         self.analyze_button = ttk.Button(file_card, text="통화 분석 시작  →", style="Primary.TButton", command=self.analyze, state="disabled")
         self.analyze_button.pack(side="left")
-        self.status = ttk.Label(outer, text="첫 실행에 음성 인식과 상담 분석 모델을 자동으로 다운로드합니다 (총 약 5.8GB).", style="Muted.TLabel")
+        self.status = ttk.Label(outer, text="첫 실행에 음성 인식과 상담 분석 모델을 자동으로 다운로드합니다 (총 약 10.9GB).", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(0, 8))
         self.model_progress = ttk.Progressbar(outer, mode="determinate", maximum=100, length=300)
         self.model_progress.pack(fill="x", pady=(0, 8))
@@ -231,7 +231,7 @@ class CallnoteApp:
         self.chat = ScrolledText(answer_panel, wrap="word", height=4, font=("Segoe UI", 9), bg="#fcfcfa", fg="#343a32", relief="solid", bd=1, padx=9, pady=8, state="disabled")
         self.chat.pack(fill="both", expand=True)
         self.root.after(250, self._balance_question_answer)
-        ttk.Label(outer, text="Whisper: OpenAI 원본 구현 · large-v3     |     요약·질문 답변: 로컬 Qwen     |     인터넷 연결 없이 사용", style="Muted.TLabel").pack(pady=(8, 0))
+        ttk.Label(outer, text="Whisper: OpenAI 원본 구현 · large-v3     |     요약·질문 답변: 로컬 Qwen3 4B     |     인터넷 연결 없이 사용", style="Muted.TLabel").pack(pady=(8, 0))
 
     def choose_file(self):
         path = filedialog.askopenfilename(title="WAV 통화 파일 선택", filetypes=[("WAV audio", "*.wav")])
@@ -311,7 +311,7 @@ class CallnoteApp:
         self.retry_button.pack_forget()
         self.model_progress.configure(mode="indeterminate")
         self.model_progress.start(12)
-        self.status.configure(text="처음 실행에 모델을 다운로드하고 있습니다. 총 용량은 약 5.8GB입니다.")
+        self.status.configure(text="처음 실행에 모델을 다운로드하고 있습니다. 총 용량은 약 10.9GB입니다.")
         threading.Thread(target=self._model_setup_job, daemon=True).start()
 
     @staticmethod
