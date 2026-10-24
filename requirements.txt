@@ -1,0 +1,13 @@
+# Desktop UI and OpenAI's original Whisper implementation
+openai-whisper>=20240930
+imageio-ffmpeg>=0.5
+
+# Local Korean Q&A and customer-support analysis model
+torch>=2.3
+transformers>=4.45,<5
+accelerate>=0.34
+safetensors>=0.4
+huggingface-hub>=0.26
+
+# Portable Windows build
+pyinstaller>=6.10
