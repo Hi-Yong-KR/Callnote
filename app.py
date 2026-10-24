@@ -5,11 +5,13 @@ import gc
 import hashlib
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import Request, urlopen
 import tkinter as tk
@@ -31,6 +33,13 @@ QA_SYSTEM = "당신은 고객센터 통화 기록 도우미입니다. 제공된 
 events: queue.Queue = queue.Queue()
 _llm_model = None
 _llm_tokenizer = None
+_generation_stop = threading.Event()
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    text: str
+    finish_reason: str
 
 
 class _NullStream:
@@ -78,6 +87,22 @@ def _error_details(exc):
     return f"{exc}\n\n자세한 오류 기록: {LOCAL_DATA / 'callnote.log'}"
 
 
+def format_transcript(result: dict) -> str:
+    paragraphs = []
+    for segment in result.get("segments", []):
+        text = segment.get("text", "").strip()
+        if not text:
+            continue
+        seconds = max(0, int(segment.get("start", 0)))
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        timestamp = f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+        paragraphs.append(f"[{timestamp}] {text}")
+    if paragraphs:
+        return "\n\n".join(paragraphs)
+    return re.sub(r"(?<=[.!?。！？])\s+", "\n\n", result.get("text", "").strip())
+
+
 def transcribe(audio_path: str) -> str:
     if not WHISPER_MODEL.is_file():
         raise RuntimeError("Whisper large-v3 모델을 찾을 수 없습니다. 인터넷 연결 후 모델 다운로드를 다시 시도해 주세요.")
@@ -98,7 +123,7 @@ def transcribe(audio_path: str) -> str:
     model = whisper.load_model(str(WHISPER_MODEL), device=device)
     events.put(("progress", f"large-v3로 한국어 통화를 전사하고 있어요 · {device.upper()}"))
     result = model.transcribe(audio_path, language="ko", task="transcribe", fp16=(gpu is not None), verbose=False)
-    transcript = result["text"].strip()
+    transcript = format_transcript(result)
     del model, result
     gc.collect()
     if gpu is not None:
@@ -106,11 +131,14 @@ def transcribe(audio_path: str) -> str:
     return transcript
 
 
-def generate(system: str, prompt: str) -> str:
+def generate(system: str, prompt: str) -> GenerationResult:
     global _llm_model, _llm_tokenizer
     if not (LLM_MODEL / "config.json").is_file() or not any(LLM_MODEL.glob("*.safetensors")):
         raise RuntimeError("질문 답변용 로컬 모델이 없습니다. 앱을 다시 시작해 모델 다운로드를 완료해 주세요.")
     import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
+
+    _generation_stop.clear()
     if _llm_model is None:
         gpu = _cuda_device(torch)
         device = str(gpu) if gpu else "cpu"
@@ -131,14 +159,61 @@ def generate(system: str, prompt: str) -> str:
     )
     input_ids = inputs["input_ids"].to(_llm_model.device)
     attention_mask = inputs["attention_mask"].to(_llm_model.device)
+    prompt_length = input_ids.shape[-1]
+    remaining_context = _llm_model.config.max_position_embeddings - prompt_length
+    if remaining_context <= 0:
+        raise RuntimeError("전사와 질문이 모델의 최대 처리 길이를 넘었습니다. 더 짧은 통화 구간을 사용해 주세요.")
+    target = "summary" if system == SUPPORT_SYSTEM else "answer"
+    events.put(("generation_start", target))
     events.put(("progress", f"답변을 생성하고 있어요 · {_llm_model.device.type.upper()}"))
-    with torch.inference_mode():
-        output = _llm_model.generate(
-            input_ids, attention_mask=attention_mask,
-            max_new_tokens=300 if system == SUPPORT_SYSTEM else 200,
-            do_sample=False, repetition_penalty=1.08,
-        )
-    return _llm_tokenizer.decode(output[0][input_ids.shape[-1]:], skip_special_tokens=True).strip()
+    streamer = TextIteratorStreamer(_llm_tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=0.2)
+    finished = threading.Event()
+    result = {}
+    errors = []
+
+    class StopOnRequest(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            return _generation_stop.is_set()
+
+    def run_generation():
+        try:
+            with torch.inference_mode():
+                result["output"] = _llm_model.generate(
+                    input_ids, attention_mask=attention_mask,
+                    # No application answer-length cap. Only the model's context
+                    # window, its EOS token, or the user's Stop action ends output.
+                    max_new_tokens=remaining_context,
+                    do_sample=False, repetition_penalty=1.08,
+                    streamer=streamer, stopping_criteria=StoppingCriteriaList([StopOnRequest()]),
+                )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=run_generation, daemon=True)
+    worker.start()
+    while True:
+        try:
+            chunk = next(streamer)
+        except StopIteration:
+            break
+        except queue.Empty:
+            if finished.is_set():
+                break
+            continue
+        if chunk:
+            events.put(("generation_text", target, chunk))
+    worker.join()
+    if errors:
+        raise errors[0]
+    tokens = result["output"][0][prompt_length:]
+    text = _llm_tokenizer.decode(tokens, skip_special_tokens=True).strip()
+    eos = _llm_model.generation_config.eos_token_id or _llm_tokenizer.eos_token_id
+    eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos])
+    ended = len(tokens) > 0 and int(tokens[-1]) in eos_ids
+    reason = "eos" if ended else "stopped" if _generation_stop.is_set() else "context_limit"
+    return GenerationResult(text, reason)
 
 
 def _download_whisper_checkpoint():
@@ -229,6 +304,7 @@ class CallnoteApp:
         self.busy = False
         self.models_ready = False
         self.model_download_running = False
+        self._answer_open = False
         self._styles()
         self._layout()
         self.root.after(100, self._poll_events)
@@ -267,8 +343,11 @@ class CallnoteApp:
         self.retry_button = ttk.Button(file_card, text="모델 다시 받기", command=self._start_model_setup)
         self.analyze_button = ttk.Button(file_card, text="통화 분석 시작  →", style="Primary.TButton", command=self.analyze, state="disabled")
         self.analyze_button.pack(side="left")
-        self.status = ttk.Label(outer, text="첫 실행에 음성 인식과 상담 분석 모델을 자동으로 다운로드합니다 (총 약 10.9GB).", style="Muted.TLabel")
-        self.status.pack(anchor="w", pady=(0, 8))
+        status_row = ttk.Frame(outer)
+        status_row.pack(fill="x", pady=(0, 8))
+        self.status = ttk.Label(status_row, text="첫 실행에 음성 인식과 상담 분석 모델을 자동으로 다운로드합니다 (총 약 10.9GB).", style="Muted.TLabel")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.stop_button = ttk.Button(status_row, text="생성 중지", command=self.stop_generation)
         self.model_progress = ttk.Progressbar(outer, mode="determinate", maximum=100, length=300)
         self.model_progress.pack(fill="x", pady=(0, 8))
 
@@ -341,6 +420,46 @@ class CallnoteApp:
         self.analyze_button.configure(state="normal" if self.audio_path and self.models_ready and not value else "disabled")
         self.ask_button.configure(state="disabled" if value else "normal")
         self.question.configure(state="disabled" if value else "normal")
+        if not value:
+            self.stop_button.pack_forget()
+            self.stop_button.configure(state="normal")
+
+    def stop_generation(self):
+        _generation_stop.set()
+        self.stop_button.configure(state="disabled")
+        self.status.configure(text="생성을 중지하고 있습니다…")
+
+    def _begin_generation(self, target):
+        self.stop_button.configure(state="normal")
+        self.stop_button.pack(side="right", padx=(8, 0))
+        if target == "summary":
+            self._set_text(self.summary, "")
+        else:
+            self.chat.configure(state="normal")
+            self.chat.insert("end-1c", "도우미: ")
+            self.chat.mark_set("answer_start", "end-1c")
+            self.chat.mark_gravity("answer_start", "left")
+            self.chat.configure(state="disabled")
+            self._answer_open = True
+
+    def _append_generation(self, target, chunk):
+        widget = self.summary if target == "summary" else self.chat
+        follow = widget.yview()[1] >= 0.98
+        widget.configure(state="normal")
+        widget.insert("end-1c", chunk)
+        if follow:
+            widget.see("end")
+        widget.configure(state="disabled")
+
+    def _finish_answer(self, text):
+        if not self._answer_open:
+            self._append_chat("도우미", text)
+            return
+        self.chat.configure(state="normal")
+        self.chat.delete("answer_start", "end-1c")
+        self.chat.insert("end-1c", text + "\n\n")
+        self.chat.configure(state="disabled")
+        self._answer_open = False
 
     def analyze(self):
         if not self.audio_path or self.busy: return
@@ -356,9 +475,10 @@ class CallnoteApp:
         try:
             transcript = transcribe(path)
             if not transcript: raise RuntimeError("음성에서 내용을 인식하지 못했습니다.")
+            events.put(("transcript_ready", transcript))
             events.put(("progress", "고객센터 상담 관점으로 내용을 정리하고 있어요…"))
             summary = generate(SUPPORT_SYSTEM, f"다음 상담 통화를 분석하세요.\n\n{transcript}")
-            events.put(("analysis_done", transcript, summary))
+            events.put(("analysis_done", transcript, summary.text, summary.finish_reason))
         except Exception as exc:
             events.put(("error", _error_details(exc)))
 
@@ -376,7 +496,7 @@ class CallnoteApp:
     def _question_job(self, prompt, transcript):
         try:
             answer = generate(QA_SYSTEM, f"통화 전사:\n{transcript}\n\n질문: {prompt}")
-            events.put(("answer_done", answer))
+            events.put(("answer_done", answer.text, answer.finish_reason))
         except Exception as exc:
             events.put(("error", _error_details(exc)))
 
@@ -405,6 +525,13 @@ class CallnoteApp:
             while True:
                 event = events.get_nowait()
                 if event[0] == "progress": self.status.configure(text=event[1])
+                elif event[0] == "transcript_ready":
+                    self.transcript = event[1]
+                    self._set_text(self.transcript_view, event[1])
+                elif event[0] == "generation_start":
+                    self._begin_generation(event[1])
+                elif event[0] == "generation_text":
+                    self._append_generation(event[1], event[2])
                 elif event[0] == "download_indeterminate":
                     self.model_progress.configure(mode="indeterminate"); self.model_progress.start(12)
                     self.status.configure(text=event[1])
@@ -427,10 +554,24 @@ class CallnoteApp:
                 elif event[0] == "analysis_done":
                     self.transcript = event[1]
                     self._set_text(self.transcript_view, event[1]); self._set_text(self.summary, event[2])
-                    self.status.configure(text="분석이 끝났어요. 상담 내용에 대해 질문해 보세요."); self._busy(False)
+                    status = "분석이 끝났어요. 상담 내용에 대해 질문해 보세요."
+                    if event[3] == "stopped":
+                        status = "요약 생성을 중지했습니다. 전사 내용은 유지됩니다."
+                    elif event[3] == "context_limit":
+                        status = "모델의 최대 처리 길이에 도달해 요약 생성을 종료했습니다."
+                    self.status.configure(text=status); self._busy(False)
                 elif event[0] == "answer_done":
-                    self._append_chat("도우미", event[1]); self._busy(False)
+                    self._finish_answer(event[1]); self._busy(False)
+                    status = "답변이 완료됐어요."
+                    if event[2] == "stopped":
+                        status = "답변 생성을 중지했습니다. 생성된 내용은 유지됩니다."
+                    elif event[2] == "context_limit":
+                        status = "모델의 최대 처리 길이에 도달해 답변 생성을 종료했습니다."
+                    self.status.configure(text=status)
                 elif event[0] == "error":
+                    if self._answer_open:
+                        partial = self.chat.get("answer_start", "end-1c")
+                        self._finish_answer(partial + "\n[답변 생성 중 오류가 발생했습니다.]")
                     self.status.configure(text="작업을 완료하지 못했어요."); self._busy(False)
                     messagebox.showerror("오류", event[1], parent=self.root)
         except queue.Empty:
