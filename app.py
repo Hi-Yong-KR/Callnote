@@ -33,9 +33,57 @@ _llm_model = None
 _llm_tokenizer = None
 
 
+class _NullStream:
+    """Minimal stdout/stderr replacement for windowed builds with no console."""
+    encoding = "utf-8"
+    errors = "replace"
+
+    def write(self, value):
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def writable(self):
+        return True
+
+
+if getattr(sys, "frozen", False):
+    if sys.stdout is None:
+        sys.stdout = _NullStream()
+    if sys.stderr is None:
+        sys.stderr = _NullStream()
+
+
+def _cuda_device(torch):
+    if not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability(0)
+    if f"sm_{major}{minor}" not in set(torch.cuda.get_arch_list()):
+        return None
+    return torch.device("cuda:0")
+
+
+def _error_details(exc):
+    detail = traceback.format_exc()
+    try:
+        LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+        with (LOCAL_DATA / "callnote.log").open("a", encoding="utf-8") as log:
+            log.write(detail + "\n")
+    except OSError:
+        pass
+    return f"{exc}\n\n자세한 오류 기록: {LOCAL_DATA / 'callnote.log'}"
+
+
 def transcribe(audio_path: str) -> str:
     if not WHISPER_MODEL.is_file():
         raise RuntimeError("Whisper large-v3 모델을 찾을 수 없습니다. 인터넷 연결 후 모델 다운로드를 다시 시도해 주세요.")
+    import torch
+    gpu = _cuda_device(torch)
+    device = str(gpu) if gpu else "cpu"
     try:
         import imageio_ffmpeg
         ffmpeg_dir = str(Path(imageio_ffmpeg.get_ffmpeg_exe()).parent)
@@ -45,14 +93,16 @@ def transcribe(audio_path: str) -> str:
     packaged_ffmpeg = ROOT / "bin"
     if packaged_ffmpeg.exists():
         os.environ["PATH"] = str(packaged_ffmpeg) + os.pathsep + os.environ.get("PATH", "")
-    events.put(("progress", "OpenAI Whisper large-v3 모델을 불러오는 중…"))
+    events.put(("progress", f"OpenAI Whisper large-v3 모델을 불러오는 중 · {device.upper()}"))
     import whisper
-    model = whisper.load_model(str(WHISPER_MODEL), device="cpu")
-    events.put(("progress", "large-v3로 한국어 통화를 전사하고 있어요…"))
-    result = model.transcribe(audio_path, language="ko", task="transcribe", fp16=False, verbose=False)
+    model = whisper.load_model(str(WHISPER_MODEL), device=device)
+    events.put(("progress", f"large-v3로 한국어 통화를 전사하고 있어요 · {device.upper()}"))
+    result = model.transcribe(audio_path, language="ko", task="transcribe", fp16=(gpu is not None), verbose=False)
     transcript = result["text"].strip()
     del model, result
     gc.collect()
+    if gpu is not None:
+        torch.cuda.empty_cache()
     return transcript
 
 
@@ -62,17 +112,32 @@ def generate(system: str, prompt: str) -> str:
         raise RuntimeError("질문 답변용 로컬 모델이 없습니다. 앱을 다시 시작해 모델 다운로드를 완료해 주세요.")
     import torch
     if _llm_model is None:
-        events.put(("progress", "로컬 상담 분석 모델을 불러오는 중…"))
+        gpu = _cuda_device(torch)
+        device = str(gpu) if gpu else "cpu"
+        dtype = torch.float32
+        load_options = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
+        if gpu is not None:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            load_options = {"torch_dtype": dtype, "device_map": str(gpu)}
+        events.put(("progress", f"로컬 상담 분석 모델을 불러오는 중 · {device.upper()}"))
         from transformers import AutoModelForCausalLM, AutoTokenizer
         _llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL, local_files_only=True)
         _llm_model = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL, local_files_only=True, torch_dtype=torch.float32, low_cpu_mem_usage=True,
+            LLM_MODEL, local_files_only=True, **load_options,
         )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-    input_ids = _llm_tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
-    events.put(("progress", "답변을 생성하고 있어요…"))
+    inputs = _llm_tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt", return_dict=True,
+    )
+    input_ids = inputs["input_ids"].to(_llm_model.device)
+    attention_mask = inputs["attention_mask"].to(_llm_model.device)
+    events.put(("progress", f"답변을 생성하고 있어요 · {_llm_model.device.type.upper()}"))
     with torch.inference_mode():
-        output = _llm_model.generate(input_ids, max_new_tokens=700, do_sample=False, repetition_penalty=1.08)
+        output = _llm_model.generate(
+            input_ids, attention_mask=attention_mask,
+            max_new_tokens=300 if system == SUPPORT_SYSTEM else 200,
+            do_sample=False, repetition_penalty=1.08,
+        )
     return _llm_tokenizer.decode(output[0][input_ids.shape[-1]:], skip_special_tokens=True).strip()
 
 
@@ -295,7 +360,7 @@ class CallnoteApp:
             summary = generate(SUPPORT_SYSTEM, f"다음 상담 통화를 분석하세요.\n\n{transcript}")
             events.put(("analysis_done", transcript, summary))
         except Exception as exc:
-            events.put(("error", str(exc)))
+            events.put(("error", _error_details(exc)))
 
     def ask(self):
         prompt = self.question.get("1.0", "end-1c").strip()
@@ -313,7 +378,7 @@ class CallnoteApp:
             answer = generate(QA_SYSTEM, f"통화 전사:\n{transcript}\n\n질문: {prompt}")
             events.put(("answer_done", answer))
         except Exception as exc:
-            events.put(("error", str(exc)))
+            events.put(("error", _error_details(exc)))
 
     def _start_model_setup(self):
         if self.model_download_running or self.models_ready:
@@ -330,14 +395,7 @@ class CallnoteApp:
         try:
             ensure_models()
         except Exception as exc:
-            detail = traceback.format_exc()
-            try:
-                LOCAL_DATA.mkdir(parents=True, exist_ok=True)
-                with (LOCAL_DATA / "callnote.log").open("a", encoding="utf-8") as log:
-                    log.write(detail + "\n")
-            except OSError:
-                pass
-            events.put(("model_error", f"{exc}\n\n자세한 오류 기록: {LOCAL_DATA / 'callnote.log'}"))
+            events.put(("model_error", _error_details(exc)))
 
     def _append_chat(self, speaker, text):
         self.chat.configure(state="normal"); self.chat.insert("end", f"{speaker}: {text}\n\n"); self.chat.see("end"); self.chat.configure(state="disabled")
