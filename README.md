@@ -11,9 +11,17 @@ GitHub Releases에서 사용할 환경에 맞는 파일 하나를 내려받습�
 
 Python, PyTorch, FFmpeg를 별도로 설치할 필요가 없습니다. 앱의 코드와 실행 종속성은 패키지에 포함되어 있습니다. GPU 패키지는 GitHub의 파일당 2GiB 제한에 맞추기 위해 7-Zip으로 압축한 단일 EXE로 배포합니다.
 
+### v1.1.0에서 작은 패치로 업데이트
+
+이미 v1.1.0을 사용 중이면 전체 패키지 대신 해당 CPU/GPU 버전의 `Callnote-v1.1.0-to-v1.1.1-…-Patch.zip`만 받을 수 있습니다. 앱을 종료하고 패치 ZIP을 임시 폴더에 압축 해제한 뒤, 그 안의 `Callnote` 폴더 내용을 기존 `Callnote` 폴더 안으로 복사해 같은 이름의 파일을 덮어쓰세요. 기존 `_internal` 폴더는 남겨 두고 파일을 합쳐야 합니다. CPU와 GPU 패치를 서로 바꾸어 적용하지 마세요. 기존 모델은 다시 받지 않습니다.
+
 첫 실행에는 앱이 모델을 자동으로 다운로드합니다. Whisper large-v3와 Qwen3 모델 합계 약 10.9GB를 받기 위해 인터넷 연결과 저장 공간이 필요합니다. 내려받은 모델은 `%LOCALAPPDATA%\Callnote\models`에 저장되고, 이후 통화 분석은 오프라인으로 실행됩니다. 다운로드가 중단되면 앱을 다시 열고 **모델 다시 받기**를 누르세요. NVIDIA GPU용 빌드는 GPU를 자동 사용하고, GPU가 없으면 CPU로 동작합니다. 일반 빌드는 CPU 전용입니다.
 
 ## 개발 및 빌드
+
+Python 3.12를 사용할 경우 **3.12.1 이상**이 필요합니다. 3.12.0에는 PyInstaller 패키징 후 요약 모델을 불러올 때 `name 'name' is not defined` 오류를 일으키는 인터프리터 문제가 있으므로 빌드 스크립트에서 차단합니다. 배포 파일에는 수정된 런타임이 포함되며, 최종 사용자가 Python을 설치할 필요는 없습니다.
+
+이미 생성한 가상 환경의 Python 버전은 자동으로 바뀌지 않습니다. 새 인터프리터를 지정하려면 `-PythonExecutable "C:\path\to\python.exe" -EnvironmentPath ".venv-pascal-new"`처럼 새 환경 경로와 함께 사용하세요.
 
 ```powershell
 py -3 -m venv .venv

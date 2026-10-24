@@ -1,17 +1,28 @@
-param([switch]$Gpu, [switch]$ModernGpu)
+param(
+    [switch]$Gpu,
+    [switch]$ModernGpu,
+    [string]$PythonExecutable,
+    [string]$EnvironmentPath
+)
 
 $ErrorActionPreference = "Stop"
 if ($Gpu -and $ModernGpu) { throw "Choose only one GPU profile." }
 
 $profile = if ($Gpu) { "pascal" } elseif ($ModernGpu) { "modern" } else { "cpu" }
 $environment = if ($profile -eq "pascal") { ".venv-pascal" } elseif ($profile -eq "modern") { ".venv-modern" } else { ".venv" }
+if ($EnvironmentPath) { $environment = $EnvironmentPath }
 $distPath = if ($profile -eq "cpu") { "dist" } else { "dist-$profile" }
 $workPath = if ($profile -eq "cpu") { "build" } else { "build-$profile" }
 
 if (-not (Test-Path "$environment\Scripts\python.exe")) {
-    py -3 -m venv $environment
+    if ($PythonExecutable) { & $PythonExecutable -m venv $environment } else { py -3 -m venv $environment }
+    if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed." }
 }
 $python = "$environment\Scripts\python.exe"
+# CPython 3.12.0 code.replace() corrupts comprehension scopes when PyInstaller
+# rewrites filenames. In a frozen build this breaks torch._numpy._ufuncs.
+& $python -c "import sys; assert sys.version_info[:3] != (3, 12, 0), 'Python 3.12.0 cannot package Callnote safely. Recreate the environment with Python 3.12.1 or newer.'"
+if ($LASTEXITCODE -ne 0) { throw "Unsupported build runtime. Use -PythonExecutable and a new -EnvironmentPath." }
 & $python -m pip install --upgrade pip
 if ($Gpu) {
     # CUDA 12.6 is the last official PyTorch wheel line that supports Pascal GPUs (e.g. Titan Xp).
